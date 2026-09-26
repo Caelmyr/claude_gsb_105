@@ -109,7 +109,32 @@ window.UI = (function () {
   function jsonPretty(obj) {
     return JSON.stringify(obj, null, 2);
   }
-  return { toast, esc, fmtTime, modal, badge, actionBadge, levelBadge, statusBadge, jsonPretty };
+  /* 评分卡得分明细渲染（评分卡页 / 沙箱页共用） */
+  function scorecardHtml(res) {
+    const lvMap = { "低": "success", "中": "info", "高": "warning", "严重": "danger" };
+    let html = `<div class="flex mb" style="align-items:center;gap:14px">
+      <span style="font-size:26px;font-weight:700">${res.total_score}<small class="muted" style="font-size:12px"> / ${res.max_score}</small></span>
+      ${res.level ? `<span class="badge ${lvMap[res.level] || "muted"}">${esc(res.level)}风险</span>` : ""}
+      ${res.action ? actionBadge(res.action) : ""}
+      <span class="muted">${esc(res.name)} · v${res.version} · 基础分 ${res.base_score}</span></div>`;
+    html += `<table><thead><tr><th>评分因子</th><th>取值来源</th><th>取值</th><th>命中分档</th><th>档位分</th><th>权重</th><th>加权分</th><th>备注</th></tr></thead><tbody>`;
+    (res.factors || []).forEach(f => {
+      const tier = f.tier ? `${esc(f.tier.label || "")} <span class="mono muted" style="font-size:11px">${esc(f.tier.range)}</span>` : "-";
+      const note = f.skipped ? `<span class="badge muted">跳过</span> ${esc(f.skip_reason || "")}` : esc(f.skip_reason || "");
+      html += `<tr>
+        <td>${esc(f.name)}</td>
+        <td class="mono" style="font-size:11px">${esc(f.source || "")}</td>
+        <td class="num">${f.value == null ? "-" : esc(f.value)}</td>
+        <td>${tier}</td>
+        <td class="num">${f.score}</td>
+        <td class="num">${f.weight}</td>
+        <td class="num"><b>${f.weighted}</b></td>
+        <td class="muted" style="font-size:12px">${note}</td></tr>`;
+    });
+    html += `</tbody></table>`;
+    return html;
+  }
+  return { toast, esc, fmtTime, modal, badge, actionBadge, levelBadge, statusBadge, jsonPretty, scorecardHtml };
 })();
 
 /* 会话 / 导航 */
@@ -133,6 +158,7 @@ window.App = (function () {
   const NAV = [
     ["index.html", "📊", "总览"],
     ["rules.html", "📜", "规则配置"],
+    ["scorecards.html", "🧮", "评分卡"],
     ["flows.html", "🔀", "决策流设计"],
     ["events.html", "⚡", "实时事件流"],
     ["alerts.html", "🔔", "告警列表"],

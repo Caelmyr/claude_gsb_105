@@ -48,12 +48,19 @@ function appendEvent(event, decision) {
   const actCls = "act-" + (decision.action || "pass");
   const actLabel = { reject: "拒绝", review: "复核", alert: "告警", pass: "放行" }[decision.action] || decision.action;
   const risk = decision.risk_score || 0;
+  const scs = decision.scorecards || [];
+  let scTag = "";
+  if (scs.length) {
+    const top = scs.reduce((a, b) => (b.total_score > a.total_score ? b : a), scs[0]);
+    scTag = `<span class="tag">评分卡 ${top.total_score}${top.level ? "·" + UI.esc(top.level) : ""}</span>`;
+  }
   const line = document.createElement("div");
   line.className = "ev-line";
   line.innerHTML = `<span class="t">${t}</span>
     <span class="tag">${icon} ${UI.esc(event.type)}</span>
     <span style="flex:1;color:#9ca3af">${UI.esc(event.ip || "")} ${UI.esc(event.user_id || "")} ${event.amount != null ? "¥" + event.amount : ""}</span>
     ${decision.matched ? `<span class="tag">命中${decision.fired_rules.length}条</span>` : ""}
+    ${scTag}
     <span class="${actCls}">${actLabel} ${risk ? "· " + risk : ""}</span>`;
   log.appendChild(line);
   lineCount++;

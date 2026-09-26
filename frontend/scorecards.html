@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>评分卡 · 风控引擎</title>
+<link rel="stylesheet" href="assets/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/javascript/javascript.min.js"></script>
+<script src="assets/js/api.js"></script>
+</head>
+<body>
+<div id="app"></div>
+<script>
+let editor = null;
+let currentCardId = null;
+
+const SAMPLE = {
+  id: "sc_demo",
+  name: "示例评分卡",
+  description: "按金额、地区、设备、频率加权评分",
+  enabled: true,
+  apply_when: [{ field: "type", op: "in", value: ["payment", "transfer", "withdraw"] }],
+  base_score: 0,
+  max_score: 100,
+  factors: [
+    {
+      id: "f_amount", name: "交易金额", field: "amount", weight: 1.0,
+      tiers: [
+        { max: 1000, score: 5, label: "小额" },
+        { min: 1000, max: 10000, score: 20, label: "中额" },
+        { min: 10000, max: 100000, score: 45, label: "大额" },
+        { min: 100000, score: 70, label: "超大额" }
+      ]
+    },
+    {
+      id: "f_country", name: "所属地区", field: "country", weight: 1.0,
+      tiers: [
+        { op: "in", value: ["RU", "BR", "NG"], score: 60, label: "高风险地区" },
+        { op: "==", value: "CN", score: 5, label: "境内" }
+      ],
+      default_score: 20
+    },
+    {
+      id: "f_new_device", name: "是否新设备", field: "risk_hint", weight: 0.8,
+      tiers: [{ op: "==", value: "new_device", score: 40, label: "新设备" }],
+      default_score: 0
+    },
+    {
+      id: "f_freq", name: "操作频率", weight: 1.0,
+      agg: { window_sec: 300, key_field: "user_id", agg_type: "count" },
+      tiers: [
+        { max: 3, score: 0, label: "正常" },
+        { min: 3, max: 10, score: 30, label: "偏高" },
+        { min: 10, score: 60, label: "异常频繁" }
+      ]
+    }
+  ],
+  levels: [
+    { name: "低", min: 0, max: 30, action: "pass" },
+    { name: "中", min: 30, max: 60, action: "alert" },
+    { name: "高", min: 60, max: 85, action: "review" },
+    { name: "严重", min: 85, action: "reject" }
+  ]
+};
+
+async function loadCards() {
+  const r = await API.get("/api/scorecards");
+  const tbody = document.getElementById("card-list");
+  tbody.innerHTML = r.scorecards.map((sc) => `
+    <tr class="clickable" data-id="${UI.esc(sc.id)}">
+      <td class="mono">${UI.esc(sc.id)}</td>
+      <td>${UI.esc(sc.name)}</td>
+      <td class="num">${sc.factor_count}</td>
+      <td>${(sc.levels || []).map(l => UI.levelBadge(l)).join(" ")}</td>
+      <td>${sc.enabled ? '<span class="badge success">启用</span>' : '<span class="badge muted">停用</span>'}</td>
+      <td>v${sc.version || 1}</td>
+      <td class="text-right">
+        <button class="btn sm ghost" data-act="toggle">${sc.enabled ? "停用" : "启用"}</button>
+        <button class="btn sm" data-act="edit">编辑</button>
+        <button class="btn sm ghost" data-act="versions">版本</button>
+        <button class="btn sm danger" data-act="del">删除</button>
+      </td>
+    </tr>`).join("");
+}
+
+async function editCard(id) {
+  const sc = (await API.get("/api/scorecards/" + id)).scorecard;
+  currentCardId = id;
+  editor.setValue(UI.jsonPretty(sc));
+  document.getElementById("card-name-label").textContent = "编辑：" + sc.name;
+}
+
+function newCard() {
+  currentCardId = null;
+  editor.setValue(UI.jsonPretty(SAMPLE));
+  document.getElementById("card-name-label").textContent = "新建评分卡";
+}
+
+async function validate() {
+  let card;
+  try { card = JSON.parse(editor.getValue()); }
+  catch (e) { UI.toast("JSON 语法错误：" + e.message, "err"); return null; }
+  const r = await API.post("/api/scorecards/validate", { scorecard: card });
+  if (!r.valid) { UI.toast("评分卡校验失败：" + r.message, "err"); return null; }
+  UI.toast("✔ " + r.message + "（因子=" + r.detail.factors + "，等级=" + r.detail.levels + "）", "ok");
+  return card;
+}
+
+async function save() {
+  let card;
+  try { card = JSON.parse(editor.getValue()); }
+  catch (e) { UI.toast("JSON 语法错误：" + e.message, "err"); return; }
+  const v = await API.post("/api/scorecards/validate", { scorecard: card });
+  if (!v.valid) { UI.toast("评分卡校验失败：" + v.message, "err"); return; }
+  try {
+    if (currentCardId) {
+      await API.put("/api/scorecards/" + currentCardId, { scorecard: card, comment: "编辑评分卡" });
+    } else {
+      const r = await API.post("/api/scorecards", { scorecard: card, comment: "新建评分卡" });
+      currentCardId = r.scorecard.id;
+    }
+    UI.toast("评分卡已保存并热更新生效", "ok");
+    loadCards();
+  } catch (e) { UI.toast(e.message, "err"); }
+}
+
+async function showVersions(id) {
+  const r = await API.get("/api/scorecards/" + id + "/versions");
+  const rows = r.history.map(h => `
+    <tr>
+      <td>v${h.version}</td>
+      <td>${UI.fmtTime(h.ts)}</td>
+      <td>${UI.esc(h.author || "")}</td>
+      <td>${UI.esc(h.comment || "")}</td>
+      <td><button class="btn sm" data-ver="${h.version}">回滚到此版</button></td>
+    </tr>`).join("");
+  const m = UI.modal("版本历史 · " + id,
+    `<table><thead><tr><th>版本</th><th>时间</th><th>操作人</th><th>说明</th><th></th></tr></thead>
+     <tbody>${rows}</tbody></table>`);
+  m.body.onclick = async (e) => {
+    const ver = e.target.dataset && e.target.dataset.ver;
+    if (!ver) return;
+    if (!confirm("确认回滚到版本 v" + ver + "？（将以新版本号重新发布）")) return;
+    try {
+      await API.post("/api/scorecards/" + id + "/rollback", { version: parseInt(ver) });
+      UI.toast("已回滚并热更新生效", "ok");
+      m.close();
+      loadCards();
+    } catch (err) { UI.toast(err.message, "err"); }
+  };
+}
+
+async function onListClick(e) {
+  const tr = e.target.closest("tr[data-id]");
+  if (!tr) return;
+  const id = tr.dataset.id;
+  const act = e.target.dataset.act;
+  if (act === "edit") { editCard(id); }
+  else if (act === "versions") { showVersions(id); }
+  else if (act === "toggle") {
+    const sc = (await API.get("/api/scorecards/" + id)).scorecard;
+    await API.post("/api/scorecards/" + id + "/enable", { enabled: !sc.enabled });
+    UI.toast("已切换启用状态（热更新）", "ok");
+    loadCards();
+  } else if (act === "del") {
+    if (!confirm("确认删除评分卡 " + id + "？")) return;
+    await API.del("/api/scorecards/" + id);
+    UI.toast("已删除", "ok");
+    loadCards();
+  } else { editCard(id); }
+}
+
+/* 沙箱预览：用编辑器中的评分卡（可不保存）对事件评分 */
+async function preview() {
+  let card, event;
+  try { card = JSON.parse(editor.getValue()); }
+  catch (e) { UI.toast("评分卡 JSON 错误：" + e.message, "err"); return; }
+  try { event = JSON.parse(document.getElementById("pv-event").value); }
+  catch (e) { UI.toast("事件 JSON 错误：" + e.message, "err"); return; }
+  const r = await API.post("/api/scorecards/preview", { scorecard: card, event });
+  if (!r.ok) { UI.toast(r.error || "预览失败", "err"); return; }
+  document.getElementById("pv-result").innerHTML = UI.scorecardHtml(r.result);
+}
+
+boot("评分卡", () => {
+  const page = document.getElementById("page");
+  page.innerHTML = `
+    <div class="grid cols-2" style="grid-template-columns: 1.15fr 1fr">
+      <div class="card">
+        <div class="card-head">
+          <h3>评分卡列表</h3>
+          <button class="btn primary sm" onclick="newCard()">＋ 新建评分卡</button>
+        </div>
+        <div class="sub">多套评分卡并存，保存后立即热更新生效；命中因子加权求和 → 综合分 → 风险等级与建议动作</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>ID</th><th>名称</th><th>因子数</th><th>等级</th><th>状态</th><th>版本</th><th></th></tr></thead>
+            <tbody id="card-list"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3 id="card-name-label">评分卡 JSON 编辑器</h3>
+          <div class="flex">
+            <button class="btn sm" onclick="validate()">语法校验</button>
+            <button class="btn sm primary" onclick="save()">保存</button>
+          </div>
+        </div>
+        <div class="sub">apply_when 限定适用事件；因子支持数值区间档（min/max）与条件档（op/value），可配权重</div>
+        <textarea id="editor"></textarea>
+        <div class="muted mt" style="font-size:12px">
+          <b>数值档：</b>{"min":1000,"max":10000,"score":20}（min 含 max 不含，可缺省）<br>
+          <b>条件档：</b>{"op":"in","value":["RU","BR"],"score":60}，op 同规则操作符<br>
+          <b>聚合因子：</b>"agg":{"window_sec":300,"key_field":"user_id","agg_type":"count"}（频率类）<br>
+          <b>等级映射：</b>levels 按综合分区间给出风险等级与建议动作（pass/alert/review/reject）
+        </div>
+      </div>
+    </div>
+    <div class="card mt">
+      <div class="card-head"><h3>🧪 沙箱预览</h3>
+        <button class="btn primary sm" onclick="preview()">用编辑器中的评分卡试算</button>
+      </div>
+      <div class="sub">不保存、不影响线上：对给定事件输出每个因子命中的分档、档位分、权重与加权分，以及综合分与等级</div>
+      <label>事件 JSON</label>
+      <textarea id="pv-event" rows="5" class="mono">${UI.esc(UI.jsonPretty({ type: "transfer", ip: "1.2.3.4", user_id: "u1001", amount: 150000, country: "RU", risk_hint: "new_device" }))}</textarea>
+      <div id="pv-result" class="mt"></div>
+    </div>`;
+  editor = CodeMirror.fromTextArea(document.getElementById("editor"), {
+    mode: { name: "javascript", json: true }, lineNumbers: true, theme: "default",
+    indentUnit: 2, tabSize: 2, lineWrapping: true
+  });
+  editor.setValue(UI.jsonPretty(SAMPLE));
+  document.getElementById("card-list").onclick = onListClick;
+  loadCards();
+});
+</script>
+</body>
+</html>

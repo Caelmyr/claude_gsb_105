@@ -20,6 +20,8 @@ EVENTS_DIR = os.path.join(DATA_DIR, "events")      # 事件：按小时分片
 ALERTS_DIR = os.path.join(DATA_DIR, "alerts")      # 告警：按天分片
 USERS_DIR = os.path.join(DATA_DIR, "users")        # 用户
 FLOWS_DIR = os.path.join(DATA_DIR, "flows")        # 决策流
+SCORECARDS_DIR = os.path.join(DATA_DIR, "scorecards")          # 评分卡：当前版本
+SCARD_VERSIONS_DIR = os.path.join(DATA_DIR, "scorecard_versions")  # 评分卡版本历史
 DICT_DIR = os.path.join(DATA_DIR, "dict")          # 数据字典
 SETTINGS_DIR = os.path.join(DATA_DIR, "settings")  # 系统设置
 WINDOWS_DIR = os.path.join(DATA_DIR, "windows")    # 滑动窗口状态（可选持久化快照）
@@ -68,7 +70,8 @@ AGG_TYPES = ["count", "sum", "avg", "distinct_count", "max", "min"]
 def ensure_dirs():
     """确保所有数据目录存在。"""
     for d in (RULES_DIR, VERSIONS_DIR, EVENTS_DIR, ALERTS_DIR, USERS_DIR,
-              FLOWS_DIR, DICT_DIR, SETTINGS_DIR, WINDOWS_DIR):
+              FLOWS_DIR, SCORECARDS_DIR, SCARD_VERSIONS_DIR,
+              DICT_DIR, SETTINGS_DIR, WINDOWS_DIR):
         os.makedirs(d, exist_ok=True)
     if not os.path.exists(SETTINGS_FILE):
         from backend.storage import atomic_write_json

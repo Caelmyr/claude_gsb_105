@@ -179,8 +179,72 @@ def seed_flow(flow_store):
     flow_store.save_flow(flow)
 
 
+def seed_scorecards(store):
+    """初始化示例评分卡（幂等：已有评分卡时跳过）。"""
+    if store.list_cards():
+        return 0
+
+    card = {
+        "id": "sc_payment_risk",
+        "name": "支付交易综合评分卡",
+        "description": "对支付/转账/提现类事件按金额、地区、设备、频率加权评分",
+        "enabled": True,
+        "apply_when": [
+            {"field": "type", "op": "in", "value": ["payment", "transfer", "withdraw"]},
+        ],
+        "base_score": 0,
+        "max_score": 100,
+        "factors": [
+            {"id": "f_amount", "name": "交易金额", "field": "amount", "weight": 1.0,
+             "missing_score": 0,
+             "tiers": [
+                 {"max": 1000, "score": 5, "label": "小额"},
+                 {"min": 1000, "max": 10000, "score": 20, "label": "中额"},
+                 {"min": 10000, "max": 100000, "score": 45, "label": "大额"},
+                 {"min": 100000, "score": 70, "label": "超大额"},
+             ]},
+            {"id": "f_country", "name": "所属地区", "field": "country", "weight": 1.0,
+             "tiers": [
+                 {"op": "in", "value": ["RU", "BR", "NG"], "score": 60, "label": "高风险地区"},
+                 {"op": "==", "value": "CN", "score": 5, "label": "境内"},
+             ],
+             "default_score": 20},
+            {"id": "f_new_device", "name": "是否新设备", "field": "risk_hint",
+             "weight": 0.8,
+             "tiers": [
+                 {"op": "==", "value": "new_device", "score": 40, "label": "新设备"},
+             ],
+             "default_score": 0},
+            {"id": "f_freq", "name": "操作频率", "weight": 1.0,
+             "agg": {"window_sec": 300, "key_field": "user_id", "agg_type": "count"},
+             "tiers": [
+                 {"max": 3, "score": 0, "label": "正常"},
+                 {"min": 3, "max": 10, "score": 30, "label": "偏高"},
+                 {"min": 10, "score": 60, "label": "异常频繁"},
+             ]},
+        ],
+        "levels": [
+            {"name": "低", "min": 0, "max": 30, "action": "pass"},
+            {"name": "中", "min": 30, "max": 60, "action": "alert"},
+            {"name": "高", "min": 60, "max": 85, "action": "review"},
+            {"name": "严重", "min": 85, "action": "reject"},
+        ],
+    }
+    store.save_card(card, author="system", comment="初始评分卡")
+
+    # 追加一次版本调整，演示版本历史与回滚
+    v2 = dict(card)
+    v2["factors"] = [dict(f) for f in card["factors"]]
+    v2["factors"][3] = dict(v2["factors"][3])
+    v2["factors"][3]["weight"] = 1.2
+    v2["description"] = "对支付/转账/提现类事件按金额、地区、设备、频率加权评分（频率权重上调至 1.2）"
+    store.save_card(v2, author="system", comment="上调操作频率权重至 1.2")
+    return len(store.list_cards())
+
+
 def seed_all(engine, flow_store):
     n_rules = seed_rules(engine.registry)
     seed_dict()
     seed_flow(flow_store)
-    return {"rules": n_rules}
+    n_cards = seed_scorecards(engine.scorecards)
+    return {"rules": n_rules, "scorecards": n_cards}

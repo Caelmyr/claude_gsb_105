@@ -84,6 +84,17 @@ async function testFlow() {
   document.getElementById("tf-result").innerHTML = `<pre class="json-view">${UI.esc(UI.jsonPretty(res.result))}</pre>`;
 }
 
+async function previewScorecard() {
+  const cardId = document.getElementById("sc-card").value;
+  let event;
+  try { event = JSON.parse(document.getElementById("sc-event").value); }
+  catch (e) { UI.toast("事件 JSON 错误：" + e.message, "err"); return; }
+  if (!cardId) { UI.toast("请选择评分卡", "warn"); return; }
+  const res = await API.post("/api/scorecards/preview", { scorecard_id: cardId, event });
+  if (!res.ok) { UI.toast(res.error, "err"); return; }
+  document.getElementById("sc-result").innerHTML = UI.scorecardHtml(res.result);
+}
+
 boot("测试沙箱", () => {
   const page = document.getElementById("page");
   page.innerHTML = `
@@ -130,10 +141,23 @@ boot("测试沙箱", () => {
         <button class="btn primary mt" onclick="testFlow()">执行决策流</button>
         <div id="tf-result" class="mt"></div>
       </div>
+
+      <div class="card">
+        <h3>🧮 评分卡预览</h3>
+        <div class="sub">选择评分卡，预览事件在各因子上的分档命中、加权得分与综合风险等级</div>
+        <select id="sc-card" style="margin-bottom:10px"></select>
+        <textarea id="sc-event" rows="5" class="mono">${UI.esc(UI.jsonPretty({ type: "transfer", ip: "1.2.3.4", user_id: "u1001", amount: 150000, country: "RU", risk_hint: "new_device" }))}</textarea>
+        <button class="btn primary mt" onclick="previewScorecard()">试算评分</button>
+        <div id="sc-result" class="mt"></div>
+      </div>
     </div>`;
   API.get("/api/flows").then(r => {
     document.getElementById("tf-flow").innerHTML =
       r.flows.map(f => `<option value="${UI.esc(f.id)}">${UI.esc(f.name)}</option>`).join("");
+  });
+  API.get("/api/scorecards").then(r => {
+    document.getElementById("sc-card").innerHTML =
+      r.scorecards.map(s => `<option value="${UI.esc(s.id)}">${UI.esc(s.name)}（v${s.version}）</option>`).join("");
   });
 });
 </script>

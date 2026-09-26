@@ -31,6 +31,10 @@ class RiskEngine:
         eng = settings.get("engine", {})
         mode = eng.get("mode", "rete")
         self.registry = RuleRegistry(mode=mode)
+        # 评分卡注册表：多套评分卡并存，不可变快照 + 原子热更新
+        # （延迟导入：scorecard 依赖 engine.rule_parser，模块级导入会循环）
+        from backend.scorecard import ScorecardStore
+        self.scorecards = ScorecardStore()
 
         self.window = SlidingWindowAggregator(
             max_keys=eng.get("window_max_keys", 200000),
@@ -39,8 +43,10 @@ class RiskEngine:
             retention_sec=eng.get("event_ttl_sec", 3600),
         )
         # 让窗口保留时长与最大聚合窗口对齐
-        self.window.set_retention(max(eng.get("event_ttl_sec", 3600),
-                                      self.registry.current.max_window_sec))
+        self._base_retention = max(eng.get("event_ttl_sec", 3600),
+                                   self.registry.current.max_window_sec)
+        self.window.set_retention(self._base_retention)
+        self._window_retention = self._base_retention
 
         alert_keep = eng.get("alert_ttl_hours", 5000)
         if alert_keep is None or alert_keep <= 0:
@@ -115,6 +121,52 @@ class RiskEngine:
         return best_type, max_score
 
     # ------------------------------------------------------------------
+    # 评分卡求值与融合
+    # ------------------------------------------------------------------
+    def _sync_window_retention(self, sc_snapshot):
+        """窗口保留时长取规则与评分卡聚合窗口的最大值（惰性同步，无变化不加锁）。"""
+        sc_max = sc_snapshot.max_window_sec if sc_snapshot else 0
+        needed = max(self._base_retention, sc_max)
+        if needed != self._window_retention:
+            self.window.set_retention(needed)
+            self._window_retention = needed
+
+    def _evaluate_scorecards(self, event, ts, sc_snapshot=None):
+        """对所有启用且适用条件命中的评分卡求值，返回各卡评分明细。"""
+        snapshot = sc_snapshot if sc_snapshot is not None else self.scorecards.current
+        results = []
+        if snapshot is None:
+            return results
+        for card in snapshot.cards:
+            if card.applies_to(event):
+                results.append(card.evaluate(event, window=self.window, ts=ts))
+        return results
+
+    def _merge_scorecards(self, action, max_score, sc_results):
+        """把评分卡结果融合进最终决策：风险分取最大值，动作按优先级取最高。"""
+        ranks = self._ACTION_RANK
+        best_action = action
+        best_rank = ranks.get(action, 0)
+        for r in sc_results:
+            score = r.get("total_score") or 0
+            if score > max_score:
+                max_score = score
+            sc_action = r.get("action")
+            if sc_action and ranks.get(sc_action, -1) > best_rank:
+                best_rank = ranks[sc_action]
+                best_action = sc_action
+        return best_action, max_score
+
+    def preview_scorecard(self, card_json, event):
+        """沙箱预览：编译评分卡（或按传入 JSON 直接编译）对事件求值，只读。"""
+        from backend.scorecard import compile_scorecard
+        ts = event.get("ts") or time.time()
+        compiled = compile_scorecard(card_json)
+        result = compiled.evaluate(event, window=self.window, ts=ts)
+        result["elapsed_note"] = "sandbox preview"
+        return result
+
+    # ------------------------------------------------------------------
     # 主入口
     # ------------------------------------------------------------------
     def process_event(self, event):
@@ -125,14 +177,23 @@ class RiskEngine:
         event.setdefault("id", event.get("id") or f"ev_{int(ts * 1000)}")
 
         snapshot = self.registry.current
+        sc_snapshot = self.scorecards.current
+        self._sync_window_retention(sc_snapshot)
 
-        # 1) 喂入滑动窗口
+        # 1) 喂入滑动窗口（规则聚合 + 评分卡聚合因子）
         for key_field, value_field in snapshot.agg_feeds:
             key = _get_field(event, key_field)
             if key is None:
                 continue
             value = _get_field(event, value_field) if value_field else None
             self.window.add(key, value=value, ts=ts)
+        if sc_snapshot:
+            for key_field, value_field in sc_snapshot.agg_feeds:
+                key = _get_field(event, key_field)
+                if key is None:
+                    continue
+                value = _get_field(event, value_field) if value_field else None
+                self.window.add(key, value=value, ts=ts)
 
         # 2) alpha 匹配
         candidates = snapshot.matcher.match(event)
@@ -164,6 +225,11 @@ class RiskEngine:
             return (r.priority, r.name)
         fired.sort(key=prio_key)
         action, max_score = self._decide(fired)
+
+        # 4.1) 评分卡求值并融合（综合风险分 = max(规则分, 评分卡分)，动作取最高优先级）
+        sc_results = self._evaluate_scorecards(event, ts, sc_snapshot=sc_snapshot)
+        if sc_results:
+            action, max_score = self._merge_scorecards(action, max_score, sc_results)
 
         # 5) 告警聚合去重
         alert_results = []
@@ -242,6 +308,7 @@ class RiskEngine:
             "action": display_action,
             "risk_score": max_score,
             "fired_rules": [_detail(r) for r in fired],
+            "scorecards": sc_results,
             "alerts": alert_results,
             "elapsed_us": elapsed_us,
             "engine_version": snapshot.version,
@@ -263,6 +330,7 @@ class RiskEngine:
         start = time.perf_counter()
         ts = event.get("ts") or time.time()
         snapshot = self.registry.current
+        sc_snapshot = self.scorecards.current
         candidates = snapshot.matcher.match(event)
         fired = []
         fired_agg = {}
@@ -288,6 +356,11 @@ class RiskEngine:
         fired.sort(key=prio_key)
         action, max_score = self._decide(fired)
 
+        # 评分卡求值并融合（只读，不改动窗口/告警状态）
+        sc_results = self._evaluate_scorecards(event, ts, sc_snapshot=sc_snapshot)
+        if sc_results:
+            action, max_score = self._merge_scorecards(action, max_score, sc_results)
+
         def _dry_detail(r):
             return {
                 "rule_id": r.id,
@@ -303,6 +376,7 @@ class RiskEngine:
             "action": action,
             "risk_score": max_score,
             "fired_rules": [_dry_detail(r) for r in fired],
+            "scorecards": sc_results,
             "elapsed_us": int((time.perf_counter() - start) * 1e6),
             "engine_version": snapshot.version,
         }

@@ -70,6 +70,23 @@ def _op_regex(a, b):
         return False
 
 
+def compare_value(a, op, b):
+    """对单个值按操作符比较（供评分卡分档等非规则场景复用）。"""
+    if op in OP_COMPARATORS:
+        return OP_COMPARATORS[op](a, b)
+    if op == "in":
+        return _op_in(a, b)
+    if op == "not_in":
+        return not _op_in(a, b)
+    if op == "contains":
+        return _op_contains(a, b)
+    if op == "regex":
+        return _op_regex(a, b)
+    if op == "exists":
+        return a is not None
+    return False
+
+
 def _freeze(value):
     """把值转为可哈希键，用于节点共享。"""
     if isinstance(value, list):
