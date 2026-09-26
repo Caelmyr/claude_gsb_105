@@ -22,6 +22,7 @@ from backend.engine.window import SlidingWindowAggregator
 from backend.engine.alert import AlertAggregator
 from backend.engine.rule_parser import _get_field
 from backend.event_store import EventStore
+from backend.scorecard import ScorecardStore
 from backend import config
 
 
@@ -52,6 +53,7 @@ class RiskEngine:
             max_alert_keep=alert_keep,
         )
         self.events = EventStore()
+        self.scorecards = ScorecardStore()
 
         self._listeners = set()
         self._listener_lock = threading.Lock()
@@ -165,6 +167,13 @@ class RiskEngine:
         fired.sort(key=prio_key)
         action, max_score = self._decide(fired)
 
+        # 4.5) 评分卡评估（只读：窗口已喂入当前事件，与规则聚合口径一致）
+        sc_results = self.scorecards.evaluate_event(event, ts=ts, window=self.window)
+        sc_top = None
+        for sc in sc_results:
+            if sc_top is None or sc["total_score"] > sc_top["total_score"]:
+                sc_top = sc
+
         # 5) 告警聚合去重
         alert_results = []
         for rule in fired:
@@ -243,6 +252,10 @@ class RiskEngine:
             "risk_score": max_score,
             "fired_rules": [_detail(r) for r in fired],
             "alerts": alert_results,
+            "scorecards": sc_results,
+            "scorecard_score": sc_top["total_score"] if sc_top else None,
+            "scorecard_level": sc_top["level"] if sc_top else None,
+            "scorecard_action": sc_top["action"] if sc_top else None,
             "elapsed_us": elapsed_us,
             "engine_version": snapshot.version,
         }
@@ -288,6 +301,8 @@ class RiskEngine:
         fired.sort(key=prio_key)
         action, max_score = self._decide(fired)
 
+        sc_results = self.scorecards.evaluate_event(event, ts=ts, window=self.window)
+
         def _dry_detail(r):
             return {
                 "rule_id": r.id,
@@ -303,6 +318,7 @@ class RiskEngine:
             "action": action,
             "risk_score": max_score,
             "fired_rules": [_dry_detail(r) for r in fired],
+            "scorecards": sc_results,
             "elapsed_us": int((time.perf_counter() - start) * 1e6),
             "engine_version": snapshot.version,
         }

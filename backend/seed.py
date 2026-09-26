@@ -179,8 +179,101 @@ def seed_flow(flow_store):
     flow_store.save_flow(flow)
 
 
+def seed_scorecards(store):
+    """初始化示例评分卡（幂等：已有评分卡时跳过）。"""
+    if store.list_cards():
+        return 0
+
+    cards = [
+        {
+            "id": "sc_transaction_risk",
+            "name": "交易风险评分卡",
+            "description": "转账/支付/提现交易：金额、地区、设备与操作频率加权评分",
+            "enabled": True,
+            "priority": 100,
+            "event_types": ["transfer", "payment", "withdraw", "order"],
+            "base_score": 0,
+            "factors": [
+                {"name": "交易金额", "type": "range", "field": "amount", "weight": 0.35,
+                 "bins": [
+                     {"max": 1000, "score": 5},
+                     {"min": 1000, "max": 10000, "score": 20},
+                     {"min": 10000, "max": 100000, "score": 45},
+                     {"min": 100000, "max": 500000, "score": 70},
+                     {"min": 500000, "score": 95},
+                 ],
+                 "default_score": 10},
+                {"name": "高风险地区", "type": "match", "field": "country", "weight": 0.2,
+                 "cases": [
+                     {"op": "in", "value": ["RU", "BR", "NG"], "score": 85},
+                 ],
+                 "default_score": 0},
+                {"name": "新设备", "type": "match", "field": "risk_hint", "weight": 0.15,
+                 "cases": [
+                     {"op": "==", "value": "new_device", "score": 60},
+                 ],
+                 "default_score": 0},
+                {"name": "短时操作频率", "type": "agg", "weight": 0.3,
+                 "agg": {"window_sec": 300, "key_field": "user_id", "agg_type": "count"},
+                 "bins": [
+                     {"max": 2, "score": 5},
+                     {"min": 2, "max": 5, "score": 40},
+                     {"min": 5, "score": 85},
+                 ],
+                 "default_score": 0},
+            ],
+            "levels": [
+                {"level": "低", "min": 0, "max": 30, "action": "pass"},
+                {"level": "中", "min": 30, "max": 55, "action": "alert"},
+                {"level": "高", "min": 55, "max": 80, "action": "review"},
+                {"level": "严重", "min": 80, "action": "reject"},
+            ],
+        },
+        {
+            "id": "sc_login_risk",
+            "name": "登录风险评分卡",
+            "description": "登录事件：登录频率、新设备与来源地区加权评分",
+            "enabled": True,
+            "priority": 90,
+            "event_types": ["login"],
+            "base_score": 0,
+            "factors": [
+                {"name": "登录频率", "type": "agg", "weight": 0.45,
+                 "agg": {"window_sec": 60, "key_field": "ip", "agg_type": "count"},
+                 "bins": [
+                     {"max": 3, "score": 5},
+                     {"min": 3, "max": 5, "score": 50},
+                     {"min": 5, "score": 90},
+                 ],
+                 "default_score": 0},
+                {"name": "新设备", "type": "match", "field": "risk_hint", "weight": 0.3,
+                 "cases": [
+                     {"op": "==", "value": "new_device", "score": 65},
+                 ],
+                 "default_score": 0},
+                {"name": "高风险地区", "type": "match", "field": "country", "weight": 0.25,
+                 "cases": [
+                     {"op": "in", "value": ["RU", "BR", "NG"], "score": 80},
+                 ],
+                 "default_score": 0},
+            ],
+            "levels": [
+                {"level": "低", "min": 0, "max": 30, "action": "pass"},
+                {"level": "中", "min": 30, "max": 55, "action": "alert"},
+                {"level": "高", "min": 55, "max": 80, "action": "review"},
+                {"level": "严重", "min": 80, "action": "reject"},
+            ],
+        },
+    ]
+
+    for c in cards:
+        store.save_card(c, author="system", comment="初始评分卡")
+    return len(store.list_cards())
+
+
 def seed_all(engine, flow_store):
     n_rules = seed_rules(engine.registry)
     seed_dict()
     seed_flow(flow_store)
+    seed_scorecards(engine.scorecards)
     return {"rules": n_rules}

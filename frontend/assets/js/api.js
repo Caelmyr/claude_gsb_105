@@ -109,7 +109,33 @@ window.UI = (function () {
   function jsonPretty(obj) {
     return JSON.stringify(obj, null, 2);
   }
-  return { toast, esc, fmtTime, modal, badge, actionBadge, levelBadge, statusBadge, jsonPretty };
+  const FACTOR_TYPE_LABEL = { range: "数值分档", match: "条件匹配", agg: "窗口聚合" };
+  function scorecardResultHtml(res) {
+    let html = `<div class="flex mb">
+      <span class="badge primary">${UI.esc(res.scorecard_name || res.scorecard_id)} v${res.version || 1}</span>
+      <span>综合分 <b>${res.total_score}</b></span>
+      ${res.level ? UI.levelBadge(res.level) : '<span class="badge muted">无等级</span>'}
+      ${UI.actionBadge(res.action)}
+    </div>`;
+    html += `<table><thead><tr><th>因子</th><th>类型</th><th>取值</th><th>命中分档/分支</th><th>分值</th><th>权重</th><th>加权分</th><th>说明</th></tr></thead><tbody>`;
+    (res.factors || []).forEach(f => {
+      const val = f.value === null || f.value === undefined ? "-" : UI.esc(f.value);
+      html += `<tr>
+        <td>${UI.esc(f.name)}</td>
+        <td>${FACTOR_TYPE_LABEL[f.type] || UI.esc(f.type)}</td>
+        <td class="mono">${val}</td>
+        <td class="mono" style="font-size:11px">${f.hit ? UI.esc(f.matched) : "-"}</td>
+        <td class="num">${f.score}</td>
+        <td class="num">${f.weight}</td>
+        <td class="num"><b>${f.weighted}</b></td>
+        <td class="muted" style="font-size:12px">${f.hit ? "命中" : UI.esc(f.reason || "缺省分")}</td>
+      </tr>`;
+    });
+    html += `</tbody></table>
+      <div class="muted mt" style="font-size:12px">综合分 = 基础分 ${res.base_score} + Σ(分值 × 权重) = <b>${res.total_score}</b></div>`;
+    return html;
+  }
+  return { toast, esc, fmtTime, modal, badge, actionBadge, levelBadge, statusBadge, jsonPretty, scorecardResultHtml, FACTOR_TYPE_LABEL };
 })();
 
 /* 会话 / 导航 */
@@ -133,6 +159,7 @@ window.App = (function () {
   const NAV = [
     ["index.html", "📊", "总览"],
     ["rules.html", "📜", "规则配置"],
+    ["scorecards.html", "🧮", "评分卡模型"],
     ["flows.html", "🔀", "决策流设计"],
     ["events.html", "⚡", "实时事件流"],
     ["alerts.html", "🔔", "告警列表"],

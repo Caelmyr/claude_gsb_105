@@ -84,6 +84,19 @@ async function testFlow() {
   document.getElementById("tf-result").innerHTML = `<pre class="json-view">${UI.esc(UI.jsonPretty(res.result))}</pre>`;
 }
 
+async function testScorecard() {
+  let event;
+  try { event = JSON.parse(document.getElementById("sc-event").value); }
+  catch (e) { UI.toast("事件 JSON 错误：" + e.message, "err"); return; }
+  const cardId = document.getElementById("sc-card").value;
+  const body = cardId ? { scorecard_id: cardId, event } : { event };
+  const r = await API.post("/api/scorecards/preview", body);
+  if (!r.ok) { UI.toast(r.error || "预览失败", "err"); return; }
+  const html = (r.results || []).map(UI.scorecardResultHtml).join('<div style="height:10px"></div>')
+    || '<div class="empty">当前无启用且适用该事件类型的评分卡</div>';
+  document.getElementById("sc-result").innerHTML = html;
+}
+
 boot("测试沙箱", () => {
   const page = document.getElementById("page");
   page.innerHTML = `
@@ -130,10 +143,24 @@ boot("测试沙箱", () => {
         <button class="btn primary mt" onclick="testFlow()">执行决策流</button>
         <div id="tf-result" class="mt"></div>
       </div>
+
+      <div class="card">
+        <h3>🧮 评分卡预览</h3>
+        <div class="sub">查看某事件在指定评分卡下的综合分、风险等级、建议动作与逐因子得分明细；不选则评估全部启用的评分卡</div>
+        <select id="sc-card" style="margin-bottom:10px"></select>
+        <textarea id="sc-event" rows="6" class="mono">${UI.esc(UI.jsonPretty({ type: "transfer", ip: "1.2.3.4", user_id: "u1", amount: 150000, country: "RU", risk_hint: "new_device" }))}</textarea>
+        <button class="btn primary mt" onclick="testScorecard()">执行评分</button>
+        <div id="sc-result" class="mt"></div>
+      </div>
     </div>`;
   API.get("/api/flows").then(r => {
     document.getElementById("tf-flow").innerHTML =
       r.flows.map(f => `<option value="${UI.esc(f.id)}">${UI.esc(f.name)}</option>`).join("");
+  });
+  API.get("/api/scorecards").then(r => {
+    document.getElementById("sc-card").innerHTML =
+      '<option value="">（全部启用的评分卡）</option>' +
+      r.scorecards.map(c => `<option value="${UI.esc(c.id)}">${UI.esc(c.name)}${c.enabled ? "" : "（已停用）"}</option>`).join("");
   });
 });
 </script>

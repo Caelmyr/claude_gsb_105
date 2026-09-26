@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>评分卡模型 · 风控引擎</title>
+<link rel="stylesheet" href="assets/css/style.css">
+<script src="assets/js/api.js"></script>
+</head>
+<body>
+<div id="app"></div>
+<script>
+let currentId = null;       // 正在编辑的评分卡 id（null = 新建）
+let editing = null;         // 编辑中的卡片模型
+
+const OPS = ["==", "!=", ">", ">=", "<", "<=", "in", "not_in", "contains", "regex", "exists"];
+const AGGS = ["count", "sum", "avg", "distinct_count", "max", "min"];
+const ACTIONS = ["pass", "alert", "review", "reject"];
+
+const SAMPLE = {
+  name: "新评分卡", description: "", enabled: true, priority: 100,
+  event_types: [], base_score: 0,
+  factors: [
+    { name: "交易金额", type: "range", field: "amount", weight: 0.5, default_score: 0,
+      bins: [{ max: 1000, score: 5 }, { min: 1000, max: 10000, score: 25 }, { min: 10000, score: 70 }] },
+  ],
+  levels: [
+    { level: "低", min: 0, max: 30, action: "pass" },
+    { level: "中", min: 30, max: 55, action: "alert" },
+    { level: "高", min: 55, max: 80, action: "review" },
+    { level: "严重", min: 80, max: null, action: "reject" },
+  ],
+};
+
+function n(v) { if (v === "" || v === null || v === undefined) return null; const x = parseFloat(v); return Number.isNaN(x) ? null : x; }
+function s(v) { return v === null || v === undefined ? "" : String(v); }
+
+/* ---------- 列表 ---------- */
+async function loadList() {
+  const r = await API.get("/api/scorecards");
+  const tbody = document.getElementById("card-list");
+  if (!tbody) return;
+  tbody.innerHTML = r.scorecards.map(c => `
+    <tr class="clickable" data-id="${UI.esc(c.id)}">
+      <td>${UI.esc(c.name)}</td>
+      <td class="mono" style="font-size:11px">${(c.event_types && c.event_types.length) ? UI.esc(c.event_types.join(", ")) : "全部事件"}</td>
+      <td class="num">${(c.factors || []).length}</td>
+      <td>${c.enabled ? '<span class="badge success">启用</span>' : '<span class="badge muted">停用</span>'}</td>
+      <td>v${c.version || 1}</td>
+      <td class="text-right">
+        <button class="btn sm ghost" data-act="toggle">${c.enabled ? "停用" : "启用"}</button>
+        <button class="btn sm" data-act="edit">编辑</button>
+        <button class="btn sm danger" data-act="del">删除</button>
+      </td>
+    </tr>`).join("") || `<tr><td colspan="6" class="empty">暂无评分卡，点击右上角「＋ 新建评分卡」</td></tr>`;
+}
+
+async function onListClick(e) {
+  const tr = e.target.closest("tr[data-id]");
+  if (!tr) return;
+  const id = tr.dataset.id;
+  const act = e.target.dataset.act;
+  if (act === "toggle") {
+    const c = (await API.get("/api/scorecards/" + id)).scorecard;
+    await API.post(`/api/scorecards/${id}/enable`, { enabled: !c.enabled });
+    UI.toast("已切换启用状态", "ok");
+    loadList();
+  } else if (act === "del") {
+    if (!confirm("确认删除评分卡 " + id + "？")) return;
+    const r = await API.del("/api/scorecards/" + id);
+    if (r.ok) { UI.toast("已删除", "ok"); loadList(); }
+    else UI.toast("删除失败（权限不足？）", "err");
+  } else {
+    const c = (await API.get("/api/scorecards/" + id)).scorecard;
+    startEdit(c);
+  }
+}
+
+/* ---------- 编辑器 ---------- */
+function startEdit(card) {
+  currentId = card.id || null;
+  editing = JSON.parse(JSON.stringify(card));
+  document.getElementById("editor-panel").classList.remove("hidden");
+  renderEditor();
+  document.getElementById("editor-panel").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function newCard() { startEdit(SAMPLE); }
+
+function renderEditor() {
+  const c = editing;
+  document.getElementById("edit-title").textContent = currentId ? `编辑：${c.name}（${currentId}）` : "新建评分卡";
+  document.getElementById("f-name").value = s(c.name);
+  document.getElementById("f-desc").value = s(c.description);
+  document.getElementById("f-priority").value = s(c.priority);
+  document.getElementById("f-base").value = s(c.base_score);
+  document.getElementById("f-types").value = (c.event_types || []).join(", ");
+  document.getElementById("f-enabled").checked = c.enabled !== false;
+  renderFactors();
+  renderLevels();
+}
+
+function renderFactors() {
+  const wrap = document.getElementById("factor-list");
+  wrap.innerHTML = editing.factors.map((f, i) => {
+    const body = f.type === "range" ? rangeBody(f, i) :
+                 f.type === "match" ? matchBody(f, i) : aggBody(f, i);
+    return `<div class="factor-block card" style="padding:12px;margin-bottom:10px" data-i="${i}">
+      <div class="row">
+        <div class="field" style="flex:2"><label>因子名称</label><input class="fx-name" value="${UI.esc(f.name)}"></div>
+        <div class="field"><label>类型</label>
+          <select class="fx-type">
+            <option value="range" ${f.type === "range" ? "selected" : ""}>数值分档</option>
+            <option value="match" ${f.type === "match" ? "selected" : ""}>条件匹配</option>
+            <option value="agg" ${f.type === "agg" ? "selected" : ""}>窗口聚合</option>
+          </select></div>
+        <div class="field"><label>权重</label><input class="fx-weight" type="number" step="0.05" min="0" value="${s(f.weight)}"></div>
+        <div class="field"><label>缺省分</label><input class="fx-default" type="number" value="${s(f.default_score)}"></div>
+        <div class="field" style="flex:0 0 auto"><label>&nbsp;</label><button class="btn sm danger fx-del">删除</button></div>
+      </div>
+      ${body}
+    </div>`;
+  }).join("");
+}
+
+function rangeBody(f, i) {
+  const bins = (f.bins || []).map((b, j) => `
+    <tr data-j="${j}">
+      <td><input class="bin-min" type="number" placeholder="-∞" value="${s(b.min)}"></td>
+      <td><input class="bin-max" type="number" placeholder="+∞" value="${s(b.max)}"></td>
+      <td><input class="bin-score" type="number" value="${s(b.score)}"></td>
+      <td><button class="btn sm ghost bin-del">✕</button></td>
+    </tr>`).join("");
+  return `<div class="field" style="margin-bottom:8px"><label>取值字段（事件 JSON 路径，如 amount / user.id）</label><input class="fx-field" value="${UI.esc(f.field || "")}"></div>
+    <label>分档区间（闭区间，自上而下首个命中生效）</label>
+    <table class="bin-table" style="margin:6px 0"><thead><tr><th>下限 ≥</th><th>上限 ≤</th><th>分值</th><th></th></tr></thead><tbody>${bins}</tbody></table>
+    <button class="btn sm bin-add">＋ 添加分档</button>`;
+}
+
+function matchBody(f, i) {
+  const cases = (f.cases || []).map((cs, j) => `
+    <tr data-j="${j}">
+      <td><select class="case-op">${OPS.map(o => `<option value="${o}" ${cs.op === o ? "selected" : ""}>${o}</option>`).join("")}</select></td>
+      <td><input class="case-value" placeholder='值，如 new_device 或 ["RU","NG"]' value="${UI.esc(caseValueText(cs.value))}"></td>
+      <td><input class="case-score" type="number" value="${s(cs.score)}"></td>
+      <td><button class="btn sm ghost case-del">✕</button></td>
+    </tr>`).join("");
+  return `<div class="field" style="margin-bottom:8px"><label>匹配字段（事件 JSON 路径，如 country / risk_hint）</label><input class="fx-field" value="${UI.esc(f.field || "")}"></div>
+    <label>分支（自上而下首个命中生效）</label>
+    <table class="bin-table" style="margin:6px 0"><thead><tr><th>算子</th><th>期望值</th><th>分值</th><th></th></tr></thead><tbody>${cases}</tbody></table>
+    <button class="btn sm case-add">＋ 添加分支</button>`;
+}
+
+function aggBody(f, i) {
+  const a = f.agg || { window_sec: 60, key_field: "", agg_type: "count" };
+  const bins = (f.bins || []).map((b, j) => `
+    <tr data-j="${j}">
+      <td><input class="bin-min" type="number" placeholder="-∞" value="${s(b.min)}"></td>
+      <td><input class="bin-max" type="number" placeholder="+∞" value="${s(b.max)}"></td>
+      <td><input class="bin-score" type="number" value="${s(b.score)}"></td>
+      <td><button class="btn sm ghost bin-del">✕</button></td>
+    </tr>`).join("");
+  return `<div class="row">
+      <div class="field"><label>聚合键字段（key_field）</label><input class="agg-key" value="${UI.esc(a.key_field || "")}"></div>
+      <div class="field" style="flex:0 0 110px"><label>窗口（秒）</label><input class="agg-window" type="number" value="${s(a.window_sec)}"></div>
+      <div class="field" style="flex:0 0 140px"><label>聚合类型</label>
+        <select class="agg-type">${AGGS.map(t => `<option value="${t}" ${a.agg_type === t ? "selected" : ""}>${t}</option>`).join("")}</select></div>
+      <div class="field"><label>值字段（sum/avg 时，可选）</label><input class="agg-valuefield" value="${UI.esc(a.value_field || "")}"></div>
+    </div>
+    <label>聚合值分档（闭区间，自上而下首个命中生效）</label>
+    <table class="bin-table" style="margin:6px 0"><thead><tr><th>下限 ≥</th><th>上限 ≤</th><th>分值</th><th></th></tr></thead><tbody>${bins}</tbody></table>
+    <button class="btn sm bin-add">＋ 添加分档</button>`;
+}
+
+function caseValueText(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "object") return JSON.stringify(v);
+  return String(v);
+}
+
+function parseCaseValue(txt) {
+  txt = txt.trim();
+  if (txt === "") return "";
+  try { return JSON.parse(txt); } catch (e) { return txt; }
+}
+
+function renderLevels() {
+  const tbody = document.getElementById("level-list");
+  tbody.innerHTML = (editing.levels || []).map((lv, j) => `
+    <tr data-j="${j}">
+      <td><input class="lv-name" value="${UI.esc(lv.level)}"></td>
+      <td><input class="lv-min" type="number" placeholder="-∞" value="${s(lv.min)}"></td>
+      <td><input class="lv-max" type="number" placeholder="+∞" value="${s(lv.max)}"></td>
+      <td><select class="lv-action">${ACTIONS.map(a => `<option value="${a}" ${lv.action === a ? "selected" : ""}>${a}</option>`).join("")}</select></td>
+      <td><button class="btn sm ghost lv-del">✕</button></td>
+    </tr>`).join("");
+}
+
+/* 结构变化前先把当前 DOM 写回模型 */
+function collectEditing() {
+  const c = editing;
+  c.name = document.getElementById("f-name").value.trim() || c.name;
+  c.description = document.getElementById("f-desc").value;
+  c.priority = n(document.getElementById("f-priority").value) ?? 100;
+  c.base_score = n(document.getElementById("f-base").value) ?? 0;
+  c.event_types = document.getElementById("f-types").value.split(/[,，\s]+/).map(x => x.trim()).filter(Boolean);
+  c.enabled = document.getElementById("f-enabled").checked;
+  document.querySelectorAll(".factor-block").forEach(block => {
+    const i = parseInt(block.dataset.i);
+    const f = c.factors[i];
+    f.name = block.querySelector(".fx-name").value.trim() || f.name;
+    f.type = block.querySelector(".fx-type").value;
+    f.weight = n(block.querySelector(".fx-weight").value) ?? 1;
+    f.default_score = n(block.querySelector(".fx-default").value) ?? 0;
+    const fieldEl = block.querySelector(".fx-field");
+    if (fieldEl) f.field = fieldEl.value.trim();
+    // 按当前实际渲染的表体读取（切换类型瞬间 select 已变而表体重绘可能尚未发生）
+    if (block.querySelector(".case-op")) {
+      f.cases = Array.from(block.querySelectorAll(".bin-table tbody tr")).map(tr => ({
+        op: tr.querySelector(".case-op").value,
+        value: parseCaseValue(tr.querySelector(".case-value").value),
+        score: n(tr.querySelector(".case-score").value) ?? 0,
+      }));
+    } else {
+      f.bins = Array.from(block.querySelectorAll(".bin-table tbody tr")).map(tr => ({
+        min: n(tr.querySelector(".bin-min").value),
+        max: n(tr.querySelector(".bin-max").value),
+        score: n(tr.querySelector(".bin-score").value) ?? 0,
+      }));
+      if (block.querySelector(".agg-key")) {
+        f.type = "agg";
+        f.agg = {
+          key_field: block.querySelector(".agg-key").value.trim(),
+          window_sec: n(block.querySelector(".agg-window").value) ?? 60,
+          agg_type: block.querySelector(".agg-type").value,
+          value_field: block.querySelector(".agg-valuefield").value.trim() || null,
+        };
+      }
+    }
+  });
+  c.levels = Array.from(document.querySelectorAll("#level-list tr")).map(tr => ({
+    level: tr.querySelector(".lv-name").value.trim(),
+    min: n(tr.querySelector(".lv-min").value),
+    max: n(tr.querySelector(".lv-max").value),
+    action: tr.querySelector(".lv-action").value,
+  })).filter(lv => lv.level);
+}
+
+/* ---------- 因子/等级结构操作（事件委托） ---------- */
+function onFactorClick(e) {
+  const btn = e.target.closest("button");
+  if (!btn) return;
+  collectEditing();
+  const block = e.target.closest(".factor-block");
+  const i = parseInt(block.dataset.i);
+  const f = editing.factors[i];
+  if (btn.classList.contains("fx-del")) { editing.factors.splice(i, 1); renderFactors(); return; }
+  if (btn.classList.contains("bin-add")) { f.bins.push({ min: null, max: null, score: 0 }); renderFactors(); return; }
+  if (btn.classList.contains("case-add")) { f.cases.push({ op: "==", value: "", score: 0 }); renderFactors(); return; }
+  if (btn.classList.contains("bin-del") || btn.classList.contains("case-del")) {
+    const tr = e.target.closest("tr");
+    const j = parseInt(tr.dataset.j);
+    if (btn.classList.contains("bin-del")) f.bins.splice(j, 1); else f.cases.splice(j, 1);
+    renderFactors();
+  }
+}
+
+function onFactorChange(e) {
+  if (e.target.classList.contains("fx-type")) {
+    collectEditing();
+    const i = parseInt(e.target.closest(".factor-block").dataset.i);
+    const f = editing.factors[i];
+    if (f.type === "range") { if (!f.bins) f.bins = [{ min: null, max: null, score: 0 }]; delete f.cases; delete f.agg; }
+    if (f.type === "match") { if (!f.cases) f.cases = [{ op: "==", value: "", score: 0 }]; delete f.bins; delete f.agg; }
+    if (f.type === "agg") { if (!f.bins) f.bins = [{ min: null, max: null, score: 0 }]; delete f.cases; f.agg = f.agg || { window_sec: 60, key_field: "", agg_type: "count" }; }
+    renderFactors();
+  }
+}
+
+function onLevelClick(e) {
+  const btn = e.target.closest("button");
+  if (!btn) return;
+  collectEditing();
+  if (btn.classList.contains("lv-add")) { editing.levels.push({ level: "", min: null, max: null, action: "alert" }); renderLevels(); return; }
+  if (btn.classList.contains("lv-del")) {
+    const j = parseInt(e.target.closest("tr").dataset.j);
+    editing.levels.splice(j, 1);
+    renderLevels();
+  }
+}
+
+/* ---------- 校验 / 保存 ---------- */
+async function doValidate() {
+  collectEditing();
+  const payload = JSON.parse(JSON.stringify(editing));
+  payload.id = currentId || "sc_draft";
+  const r = await API.post("/api/scorecards/validate", { scorecard: payload });
+  if (r.valid) {
+    UI.toast(`✔ ${r.message}（因子 ${r.detail.factors} 个，等级 ${r.detail.levels} 档）`, "ok");
+  } else {
+    UI.toast("校验失败：" + r.message, "err");
+  }
+}
+
+async function save() {
+  collectEditing();
+  const payload = JSON.parse(JSON.stringify(editing));
+  if (!payload.name) { UI.toast("请填写评分卡名称", "err"); return; }
+  if (currentId) payload.id = currentId;
+  try {
+    if (currentId) {
+      const r = await API.put("/api/scorecards/" + currentId, { scorecard: payload, comment: "编辑评分卡" });
+      UI.toast("评分卡已保存（新版本 v" + r.scorecard.version + "）", "ok");
+      startEdit(r.scorecard);
+    } else {
+      const r = await API.post("/api/scorecards", { scorecard: payload, comment: "新建评分卡" });
+      UI.toast("评分卡已创建：" + r.scorecard.id, "ok");
+      startEdit(r.scorecard);
+    }
+    loadList();
+  } catch (err) { UI.toast(err.message, "err"); }
+}
+
+/* ---------- 版本历史 ---------- */
+async function showHistory() {
+  collectEditing();
+  if (!currentId) { UI.toast("请先保存评分卡", "warn"); return; }
+  const r = await API.get(`/api/scorecards/${currentId}/versions`);
+  const rows = r.history.map(h => `
+    <tr>
+      <td class="num">v${h.version}</td>
+      <td>${UI.esc(h.author)}</td>
+      <td>${UI.esc(h.comment)}</td>
+      <td class="mono">${UI.fmtTime(h.ts)}</td>
+      <td class="text-right">
+        <button class="btn sm" data-v="${h.version}" data-act="view">查看</button>
+        <button class="btn sm warning" data-v="${h.version}" data-act="rollback">回滚</button>
+      </td>
+    </tr>`).join("");
+  const m = UI.modal(`版本历史 · ${editing.name}`, `
+    <div class="table-wrap"><table>
+      <thead><tr><th>版本</th><th>操作者</th><th>说明</th><th>时间</th><th></th></tr></thead>
+      <tbody id="hist-body">${rows}</tbody>
+    </table></div>
+    <pre class="json-view mt" id="hist-json" style="max-height:240px">（点击「查看」展示该版本内容）</pre>`,
+    `<button class="btn" onclick="document.getElementById('modal-mask').classList.remove('show')">关闭</button>`);
+  m.body.onclick = async (e) => {
+    const btn = e.target.closest("button[data-act]");
+    if (!btn) return;
+    const version = parseInt(btn.dataset.v);
+    const h = r.history.find(x => x.version === version);
+    if (btn.dataset.act === "view") {
+      document.getElementById("hist-json").textContent = UI.jsonPretty(h.card);
+    } else {
+      if (!confirm(`确认回滚到 v${version}？将以更高版本号重新发布。`)) return;
+      const rb = await API.post(`/api/scorecards/${currentId}/rollback`, { version });
+      if (rb.ok) {
+        UI.toast("已回滚（新版本 v" + rb.scorecard.version + "）", "ok");
+        m.close();
+        startEdit(rb.scorecard);
+        loadList();
+      } else UI.toast("回滚失败（权限不足？）", "err");
+    }
+  };
+}
+
+/* ---------- 沙箱预览 ---------- */
+async function preview() {
+  collectEditing();
+  let event;
+  try { event = JSON.parse(document.getElementById("pv-event").value); }
+  catch (e) { UI.toast("事件 JSON 错误：" + e.message, "err"); return; }
+  const payload = JSON.parse(JSON.stringify(editing));
+  payload.id = currentId || "sc_draft";
+  try {
+    const r = await API.post("/api/scorecards/preview", { scorecard: payload, event });
+    const html = r.results.map(UI.scorecardResultHtml).join('<div style="height:10px"></div>')
+      || '<div class="empty">当前无适用的评分卡</div>';
+    document.getElementById("pv-result").innerHTML = html;
+  } catch (err) { UI.toast(err.message, "err"); }
+}
+
+/* ---------- 页面骨架 ---------- */
+boot("评分卡模型", () => {
+  const page = document.getElementById("page");
+  page.innerHTML = `
+    <div class="grid" style="grid-template-columns: 360px 1fr">
+      <div class="card">
+        <div class="card-head"><h3>🧮 评分卡列表</h3>
+          <button class="btn primary sm" onclick="newCard()">＋ 新建</button></div>
+        <div class="sub">多套评分卡可并存，按优先级与事件类型对事件加权评分</div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>名称</th><th>适用事件</th><th>因子</th><th>状态</th><th>版本</th><th></th></tr></thead>
+          <tbody id="card-list"></tbody>
+        </table></div>
+      </div>
+
+      <div class="card hidden" id="editor-panel">
+        <div class="card-head"><h3 id="edit-title">新建评分卡</h3>
+          <div class="flex">
+            <button class="btn sm" onclick="showHistory()">🕘 版本历史</button>
+            <button class="btn sm" onclick="doValidate()">语法校验</button>
+            <button class="btn sm primary" onclick="save()">保存</button>
+          </div></div>
+        <div class="sub">综合分 = 基础分 + Σ(因子分 × 权重)，再映射到风险等级与建议动作；保存即产生新版本并立即生效</div>
+
+        <h3 style="font-size:14px;margin:6px 0">基本信息</h3>
+        <div class="row">
+          <div class="field" style="flex:2"><label>名称</label><input id="f-name"></div>
+          <div class="field" style="flex:0 0 110px"><label>优先级</label><input id="f-priority" type="number"></div>
+          <div class="field" style="flex:0 0 110px"><label>基础分</label><input id="f-base" type="number" step="0.5"></div>
+        </div>
+        <div class="row">
+          <div class="field" style="flex:2"><label>适用事件类型（逗号分隔，留空 = 全部事件）</label><input id="f-types" placeholder="transfer, payment, withdraw"></div>
+          <div class="field" style="flex:0 0 120px"><label>状态</label>
+            <label style="font-weight:400;margin:8px 0 0"><input type="checkbox" id="f-enabled" style="width:auto;margin-right:6px">启用</label></div>
+        </div>
+        <div class="field"><label>说明</label><input id="f-desc"></div>
+
+        <div class="between" style="margin:14px 0 6px"><h3 style="font-size:14px;margin:0">评分因子</h3>
+          <button class="btn sm" onclick="collectEditing();editing.factors.push({name:'新因子',type:'range',field:'',weight:1,default_score:0,bins:[{min:null,max:null,score:0}]});renderFactors()">＋ 添加因子</button></div>
+        <div id="factor-list"></div>
+
+        <div class="between" style="margin:16px 0 6px"><h3 style="font-size:14px;margin:0">风险等级映射</h3>
+          <button class="btn sm lv-add">＋ 添加等级</button></div>
+        <table class="bin-table"><thead><tr><th>等级</th><th>分数 ≥</th><th>分数 ≤</th><th>建议动作</th><th></th></tr></thead>
+          <tbody id="level-list"></tbody></table>
+
+        <h3 style="font-size:14px;margin:18px 0 6px">🧪 沙箱预览（不保存也可预览当前编辑内容）</h3>
+        <textarea id="pv-event" rows="6" class="mono"></textarea>
+        <button class="btn primary mt" onclick="preview()">执行预览</button>
+        <div id="pv-result" class="mt"></div>
+      </div>
+    </div>`;
+  document.getElementById("card-list").onclick = onListClick;
+  document.getElementById("factor-list").onclick = onFactorClick;
+  document.getElementById("factor-list").onchange = onFactorChange;
+  document.getElementById("level-list").onclick = onLevelClick;
+  document.querySelector("#editor-panel .lv-add").onclick = onLevelClick;
+  document.getElementById("pv-event").value = UI.jsonPretty({
+    type: "transfer", ip: "1.2.3.4", user_id: "u1",
+    amount: 150000, country: "CN", risk_hint: "new_device"
+  });
+  loadList();
+});
+</script>
+</body>
+</html>

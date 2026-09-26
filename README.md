@@ -1,16 +1,17 @@
 # 实时风控规则引擎与决策流 (Real-time Risk Control Rule Engine & Decision Flow)
 
-一个完整的实时风控规则引擎与决策流系统，支持可视化规则配置、决策流拖拽编排、WebSocket 实时事件流、滑动窗口聚合（短时高频计数）、规则动态热更新与版本回滚、告警聚合去重、统计报表与测试沙箱。
+一个完整的实时风控规则引擎与决策流系统，支持可视化规则配置、可配置评分卡风险模型、决策流拖拽编排、WebSocket 实时事件流、滑动窗口聚合（短时高频计数）、规则动态热更新与版本回滚、告警聚合去重、统计报表与测试沙箱。
 
-规则、事件、告警全部以 JSON 文件存储（规则按版本、事件按小时分片），无外部数据库依赖，开箱即用。
+规则、评分卡、事件、告警全部以 JSON 文件存储（规则按版本、事件按小时分片），无外部数据库依赖，开箱即用。
 
 ## 🚀 功能特性
 
-### 前端（10 个页面，原生 HTML/CSS/JS）
+### 前端（12 个页面，原生 HTML/CSS/JS）
 | 页面 | 路径 | 说明 |
 |------|------|------|
 | 登录 / 总览 | `index.html` | 登录认证、系统概览看板、关键指标 |
 | 规则配置 | `rules.html` | 规则 CRUD、CodeMirror JSON 编辑器、语法校验、启停 |
+| 评分卡模型 | `scorecards.html` | 评分因子/分档/权重可视化配置、等级映射、版本回滚、沙箱预览 |
 | 决策流设计 | `flows.html` | 可视化拖拽节点（条件 / 动作 / 分支）编排决策流 |
 | 实时事件流 | `events.html` | WebSocket 滚动展示实时事件与命中告警 |
 | 告警列表 | `alerts.html` | 告警查询、去重计数、标记处理、导出（CSV/JSON） |
@@ -18,11 +19,12 @@
 | 用户管理 | `users.html` | 用户 CRUD、角色（admin/analyst/viewer）、重置密码 |
 | 系统设置 | `settings.html` | 匹配模式切换、去重窗口、滑动窗口容量参数 |
 | 规则版本管理 | `versions.html` | 版本历史、LCS 行级 diff、一键回滚 |
-| 测试沙箱 | `sandbox.html` | 单事件 dry-run、单规则测试、决策流测试、窗口预热 |
+| 测试沙箱 | `sandbox.html` | 单事件 dry-run、单规则测试、决策流测试、评分卡预览、窗口预热 |
 | 数据字典 | `dict.html` | 事件类型、风险等级、动作类型等枚举统一维护 |
 
 ### 后端（Python + Flask）
 - **高性能规则匹配**：Rete 风格 alpha 判别网络（类型哈希路由 + 条件节点共享），可选决策树匹配器
+- **可配置评分卡**：多评分因子（数值分档 / 条件匹配 / 窗口聚合）+ 分档分值 + 权重加权求和，映射风险等级与建议动作；多卡并存、启停、版本回滚、沙箱逐因子预览
 - **滑动窗口精确聚合**：时间有序双端队列 + 惰性淘汰，均摊 O(1) 精确计数（count/sum/avg/max/min/distinct_count）
 - **动态规则热更新**：不可变编译快照 + 单引用原子替换，更新/删除/启停/回滚全程不中断匹配
 - **版本回滚**：每次保存追加版本历史快照，回滚以更高版本号重新发布
@@ -42,6 +44,7 @@ gsb3/
 │   ├── auth.py                # 认证、SHA-256 加盐密码、角色鉴权装饰器、默认账号
 │   ├── event_store.py         # 事件存储：内存缓冲 + 后台刷盘线程
 │   ├── flows.py               # 决策流编译与执行（条件/动作/分支）
+│   ├── scorecard.py           # 评分卡：因子编译、加权评分、等级映射、版本管理
 │   ├── settings_store.py      # 系统设置读写（深合并）
 │   ├── seed.py                # 样例数据初始化（10 条规则、字典、示例决策流，幂等）
 │   ├── runtime.py             # 运行时单例引用
@@ -55,6 +58,7 @@ gsb3/
 │   │   └── engine.py          # 风控引擎编排：匹配→聚合→决策→去重→持久化→广播
 │   └── api/
 │       ├── rules.py           # 规则 CRUD、校验、版本、回滚
+│       ├── scorecards.py      # 评分卡 CRUD、启停、版本回滚、沙箱预览
 │       ├── events.py          # 事件查询、摄取、模拟突发、存储统计
 │       ├── alerts.py          # 告警查询、标记、导出、统计
 │       ├── stats.py           # 统计报表（命中率/拒绝率/趋势）
@@ -91,6 +95,12 @@ python run.py
 
 ## 🎯 核心难点解决方案
 
+### 0. 可配置评分卡风险模型
+- **因子化评分**：每张评分卡由多个评分因子组成，因子支持三种取值方式——`range`（事件字段数值分档）、`match`（条件算子分支匹配，复用规则条件编译器）、`agg`（滑动窗口聚合值分档，与规则共用同一窗口，口径一致）；每个因子配置分档区间与对应分值、权重
+- **加权求和 + 等级映射**：综合分 = 基础分 + Σ(因子分 × 权重)，按等级区间映射风险等级（低/中/高/严重）与建议动作（pass/alert/review/reject）；分档与等级均为「自上而下首个命中生效」，边界闭区间、可开口
+- **多卡并存与版本管理**：多张评分卡按 `event_types` + 优先级适用于不同事件，可独立启停；每次保存追加版本快照，回滚以更高版本号重新发布（与规则版本管理同一套语义）
+- **沙箱逐因子预览**：`POST /api/scorecards/preview` 支持已保存评分卡、未保存草稿卡、全部启用卡三种模式，返回每个因子的取值、命中分档、分值、权重与加权分；事件主链路（`process_event` / `dry_run`）的决策结果中同步附带 `scorecards` 明细与最高分卡的 `scorecard_score / scorecard_level / scorecard_action`
+
 ### 1. 规则引擎高性能匹配
 - **Rete 风格 alpha 判别网络**：按事件类型哈希路由（`TypeNode` 根分桶）+ 条件节点跨规则共享，避免对每条规则重复判定相同条件；匹配复杂度与「命中条件数」相关而非「规则总数」
 - **决策树备选**：以「出现频次最高」的条件贪心分裂构造二叉判定树，命中即下钻、未命中即剪枝，减少平均判定次数；含「真/假」双分支设计保证缺字段/不相干条件正确剪枝
@@ -116,6 +126,7 @@ python run.py
 
 - 认证：`POST /api/login`、`POST /api/logout`、`GET /api/me`
 - 规则：`GET/POST /api/rules`、`GET/PUT/DELETE /api/rules/<id>`、`POST /api/rules/validate`、`POST /api/rules/<id>/enable`、`GET /api/rules/<id>/versions`、`POST /api/rules/<id>/rollback`
+- 评分卡：`GET/POST /api/scorecards`、`GET/PUT/DELETE /api/scorecards/<id>`、`POST /api/scorecards/validate`、`POST /api/scorecards/<id>/enable`、`GET /api/scorecards/<id>/versions`、`POST /api/scorecards/<id>/rollback`、`POST /api/scorecards/preview`
 - 事件：`GET /api/events`、`POST /api/events/ingest`、`POST /api/events/simulate`、`GET /api/events/store_stats`
 - 告警：`GET /api/alerts`、`POST /api/alerts/mark`、`GET /api/alerts/export`、`GET /api/alerts/stats`
 - 统计：`GET /api/stats`、`POST /api/stats/reset`
